@@ -11,17 +11,47 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import pytz
 import logging
+from logging.handlers import RotatingFileHandler
 import fitz  # PyMuPDF
 import requests
 import openai
 
-# 设置日志
-logging.basicConfig(
-    level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s'
-)
+def setup_logging(log_file):
+    """设置日志配置，包括控制台和文件输出"""
+    # 确保日志目录存在
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    
+    # 获取根日志记录器并清除现有的处理器
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # 创建格式化器
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    
+    # 设置根日志记录器级别
+    root_logger.setLevel(logging.INFO)
+    
+    # 创建并配置文件处理器（使用 RotatingFileHandler 进行日志轮转）
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.ERROR)  # 文件只记录 ERROR 级别及以上的日志
+    file_handler.setFormatter(formatter)
+    
+    # 创建并配置控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    
+    # 将处理器添加到根日志记录器
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
 
-DEBUG = True
-
+DEBUG = False
 
 # 缓存相关函数
 def get_pdf_hash(pdf_path):
@@ -152,7 +182,7 @@ def extract_pdf_content(pdf_path, cache_dir):
   cached_text = load_text_cache(cache_dir)
   cached_images = load_cache(cache_dir, "extracted_images")
 
-  if cached_text && cached_images:
+  if cached_text and cached_images:
     return cached_text, cached_images
 
   # 没有缓存，从PDF提取
@@ -185,56 +215,56 @@ def extract_pdf_content(pdf_path, cache_dir):
 
 async def process_image(image_path, page_num, model_config, cache_dir):
   """异步处理单张图片，返回图片总结"""
-  # 检查是否有图片总结缓存
   cache_name = f"image_summary_{os.path.basename(image_path)}"
   cached_summary = load_cache(cache_dir, cache_name)
 
   if cached_summary:
     return page_num, cached_summary
 
-  # 等待时间窗口
   wait_until_available(model_config["available_hours"])
 
-  # 调用API进行图像理解
-  try:
-    client = openai.OpenAI(
-        base_url=model_config["url"], api_key=model_config["api_key"]
-    )
-
-    with open(image_path, "rb") as img_file:
-      response = client.chat.completions.create(
-          model=model_config["name"],
-          messages=[
-              {
-                  "role":
-                      "user",
-                  "content":
-                      [
-                          {
-                              "type": "text",
-                              "text": "这张图片中包含什么内容？请提供一个简短的总结。"
-                          }, {
-                              "type": "image_url",
-                              "image_url":
-                                  {
-                                      "url":
-                                          f"data:image/png;base64,{base64.b64encode(img_file.read()).decode('utf-8')}"
-                                  }
-                          }
-                      ]
-              }
-          ]
+  retries = 0
+  last_error = None
+  
+  while retries < model_config["max_retries"]:
+    try:
+      client = openai.OpenAI(
+          base_url=model_config["url"],
+          api_key=model_config["api_key"]
       )
 
-    summary = response.choices[0].message.content
+      with open(image_path, "rb") as img_file:
+        response = client.chat.completions.create(
+            model=model_config["name"],
+            messages=[{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": f"{model_config['prompt']} 请使用{model_config['response_language']}回答。"
+                }, {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{base64.b64encode(img_file.read()).decode('utf-8')}"
+                    }
+                }]
+            }]
+        )
 
-    # 缓存结果
-    save_cache(cache_dir, cache_name, summary)
-
-    return page_num, summary
-  except Exception as e:
-    logging.error(f"处理图片 {image_path} 失败: {str(e)}")
-    return page_num, f"图像理解失败: {str(e)}"
+      summary = response.choices[0].message.content
+      save_cache(cache_dir, cache_name, summary)
+      return page_num, summary
+      
+    except Exception as e:
+      last_error = str(e)
+      retries += 1
+      if retries < model_config["max_retries"]:
+        wait_time = 2 ** retries  # 指数退避
+        logging.error(f"处理图片 {image_path} 失败 (尝试 {retries}/{model_config['max_retries']}): {str(e)}")
+        await asyncio.sleep(wait_time)
+      else:
+        logging.error(f"处理图片 {image_path} 最终失败: {str(e)}")
+        
+  return page_num, f"图像理解失败 (重试 {model_config['max_retries']} 次): {last_error}"
 
 
 # 文本处理相关函数
@@ -306,74 +336,93 @@ def split_text_into_chunks(text, max_tokens=20000):
 
 
 async def process_text_chunk(
-    client, model_name, chunk, previous_summary, cache_dir, chunk_index
+    client, model_name, chunk, previous_summary, cache_dir, chunk_index, text_model_config
 ):
   """异步处理文本块，返回总结"""
-  # 检查缓存
   cache_name = f"text_summary_chunk_{chunk_index}"
   cached_summary = load_cache(cache_dir, cache_name)
 
   if cached_summary:
     return cached_summary
 
-  # 生成总结
-  try:
-    messages = [{"role": "system", "content": "你是一个助手，专门为给定的文本生成中文读书笔记。"}]
+  retries = 0
+  last_error = None
+  
+  while retries < text_model_config["max_retries"]:
+    try:
+      messages = [{
+          "role": "system",
+          "content": f"{text_model_config['system_prompt']} 请使用{text_model_config['response_language']}回答。"
+      }]
 
-    if previous_summary:
-      prompt = f"下面是我之前总结的内容：\n\n{previous_summary}\n\n请基于上面的总结，继续为以下新的内容生成读书笔记，保持连贯性和一致性：\n\n{chunk}"
-    else:
-      prompt = f"请为以下文本撰写中文读书笔记: {chunk}"
+      if previous_summary:
+        prompt = text_model_config["continue_prompt"].replace("{previous_summary}", previous_summary) + f"\n\n{chunk}"
+      else:
+        prompt = f"{text_model_config['user_prompt']} {chunk}"
 
-    messages.append({"role": "user", "content": prompt})
+      messages.append({"role": "user", "content": prompt})
 
-    response = client.chat.completions.create(
-        model=model_name, messages=messages
-    )
-    summary = response.choices[0].message.content
-
-    # 缓存结果
-    save_cache(cache_dir, cache_name, summary)
-
-    return summary
-  except Exception as e:
-    logging.error(f"生成总结失败: {e}")
-    return f"生成总结失败: {str(e)}"
+      response = client.chat.completions.create(
+          model=model_name,
+          messages=messages
+      )
+      summary = response.choices[0].message.content
+      save_cache(cache_dir, cache_name, summary)
+      return summary
+      
+    except Exception as e:
+      last_error = str(e)
+      retries += 1
+      if retries < text_model_config["max_retries"]:
+        wait_time = 2 ** retries  # 指数退避
+        logging.error(f"生成总结失败 (尝试 {retries}/{text_model_config['max_retries']}): {str(e)}")
+        await asyncio.sleep(wait_time)
+      else:
+        logging.error(f"生成总结最终失败: {str(e)}")
+        
+  return f"生成总结失败 (重试 {text_model_config['max_retries']} 次): {last_error}"
 
 
 async def generate_final_summary(
-    client, model_name, accumulated_summary, cache_dir
+    client, model_name, accumulated_summary, cache_dir, text_model_config
 ):
   """异步生成最终总结"""
-  # 检查缓存
   cache_name = "final_summary"
   cached_summary = load_cache(cache_dir, cache_name)
 
   if cached_summary:
     return cached_summary
 
-  try:
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {
-                "role": "system",
-                "content": "你是一个助手，专门为给定的文本生成中文读书笔记。"
-            }, {
-                "role": "user",
-                "content": f"请为以下内容撰写一个精炼的最终读书笔记: {accumulated_summary}"
-            }
-        ]
-    )
-    summary = response.choices[0].message.content
-
-    # 缓存结果
-    save_cache(cache_dir, cache_name, summary)
-
-    return summary
-  except Exception as e:
-    logging.error(f"生成最终总结失败: {e}")
-    return accumulated_summary  # 失败时返回原累积总结
+  retries = 0
+  last_error = None
+  
+  while retries < text_model_config["max_retries"]:
+    try:
+      response = client.chat.completions.create(
+          model=model_name,
+          messages=[{
+              "role": "system",
+              "content": text_model_config["system_prompt"]
+          }, {
+              "role": "user",
+              "content": f"{text_model_config['final_summary_prompt']} {accumulated_summary}"
+          }]
+      )
+      summary = response.choices[0].message.content
+      save_cache(cache_dir, cache_name, summary)
+      return summary
+      
+    except Exception as e:
+      last_error = str(e)
+      retries += 1
+      if retries < text_model_config["max_retries"]:
+        wait_time = 2 ** retries  # 指数退避
+        logging.error(f"生成最终总结失败 (尝试 {retries}/{text_model_config['max_retries']}): {str(e)}")
+        await asyncio.sleep(wait_time)
+      else:
+        logging.error(f"生成最终总结最终失败: {str(e)}")
+        
+  return accumulated_summary  # 失败时返回原累积总结
 
 
 async def process_pdf(pdf_path, config):
@@ -400,12 +449,19 @@ async def process_pdf(pdf_path, config):
     image_model_config = config["models"]["image_model"]
     text_model_config = config["models"]["text_model"]
 
+    # 创建图片处理的信号量
+    image_semaphore = asyncio.Semaphore(config["parallel_processes"]["images"])
+    text_semaphore = asyncio.Semaphore(config["parallel_processes"]["text_chunks"])
+
     # 启动图片处理任务
-    image_tasks = []
-    for page_num, image_path in images:
-      image_tasks.append(
-          process_image(image_path, page_num, image_model_config, cache_dir)
-      )
+    async def process_image_with_semaphore(image_path, page_num):
+      async with image_semaphore:
+        return await process_image(image_path, page_num, image_model_config, cache_dir)
+
+    image_tasks = [
+        process_image_with_semaphore(image_path, page_num)
+        for page_num, image_path in images
+    ]
 
     # 异步等待所有图片处理完成
     image_results = await asyncio.gather(*image_tasks)
@@ -427,54 +483,51 @@ async def process_pdf(pdf_path, config):
     # 等待文本处理时间窗口
     wait_until_available(text_model_config["available_hours"])
 
-    # 逐批处理文本
-    accumulated_summary = ""
+    # 创建处理文本块的函数
+    async def process_chunk_with_semaphore(chunk, chunk_index, previous_summary):
+      async with text_semaphore:
+        # 查找与当前文本块相关的图片
+        pages_per_chunk = max(1, len(images) // len(text_chunks))
+        start_page = chunk_index * pages_per_chunk
+        end_page = (chunk_index + 1) * pages_per_chunk if chunk_index < len(text_chunks - 1) else float('inf')
+
+        # 添加本文本块涉及页面的图片总结
+        related_images = [
+            f"[图片总结 (第 {page_num + 1} 页): {image_summaries.get(page_num, '无总结')}]"
+            for page_num, _ in images if start_page <= page_num < end_page
+        ]
+
+        chunk_with_images = chunk
+        if related_images:
+          chunk_with_images += "\n\n" + "\n".join(related_images)
+
+        return await process_text_chunk(
+            text_client, text_model_config["name"], chunk_with_images,
+            previous_summary, cache_dir, chunk_index, text_model_config
+        )
+
+    # 并行处理文本块
+    chunk_tasks = []
+    previous_summaries = {}  # 用于存储每个块的前序总结
+
+    # 创建所有文本块的处理任务
     for i, chunk in enumerate(text_chunks):
-      # 添加相关页面的图片总结到文本块
-      chunk_with_images = chunk
+      previous_summary = previous_summaries.get(i-1, "") if i > 0 else ""
+      task = process_chunk_with_semaphore(chunk, i, previous_summary)
+      chunk_tasks.append(task)
 
-      # 查找与当前文本块相关的图片
-      # 假设按页码分布：每个块处理文档的一部分页面
-      pages_per_chunk = max(1, len(images) // len(text_chunks))
-      start_page = i * pages_per_chunk
-      end_page = (i + 1) * pages_per_chunk if i < len(text_chunks
-                                                     ) - 1 else float('inf')
+    # 等待所有文本块处理完成
+    chunk_results = await asyncio.gather(*chunk_tasks)
 
-      # 添加本文本块涉及页面的图片总结
-      related_images = [
-          f"[图片总结 (第 {page_num + 1} 页): {image_summaries.get(page_num, '无总结')}]"
-          for page_num, _ in images if start_page <= page_num < end_page
-      ]
-
-      if related_images:
-        chunk_with_images += "\n\n" + "\n".join(related_images)
-
-      logging.info(f"处理第 {i+1}/{len(text_chunks)} 批文本")
-
-      # 生成当前批次的总结
-      summary_chunk = await process_text_chunk(
-          text_client, text_model_config["name"], chunk_with_images,
-          accumulated_summary, cache_dir, i
-      )
-
-      # 累积总结结果
-      if accumulated_summary:
-        accumulated_summary = f"{accumulated_summary}\n\n{summary_chunk}"
-      else:
-        accumulated_summary = summary_chunk
-
-      # 保存中间结果
-      save_cache(cache_dir, "accumulated_summary", accumulated_summary)
-
-      # 防止API请求过于频繁
-      await asyncio.sleep(5)
+    # 合并所有文本块的总结
+    accumulated_summary = "\n\n".join(chunk_results)
 
     # 如果文本比较长（有多个块），生成最终摘要
     final_summary = accumulated_summary
     if len(text_chunks) > 1:
       logging.info(f"生成最终总结")
       final_summary = await generate_final_summary(
-          text_client, text_model_config["name"], accumulated_summary, cache_dir
+          text_client, text_model_config["name"], accumulated_summary, cache_dir, text_model_config
       )
 
     # 保存读书笔记到Markdown文件
@@ -502,6 +555,9 @@ async def main_async():
   try:
     with open("config.json", 'r', encoding='utf-8') as f:
       config = json.load(f)
+    
+    # 设置日志
+    setup_logging(config["log_file"])
     logging.info(f"已成功加载配置文件")
   except Exception as e:
     logging.error(f"加载配置文件失败: {e}")
@@ -511,18 +567,26 @@ async def main_async():
   os.makedirs(config["output_folder"], exist_ok=True)
   os.makedirs(config["cache_folder"], exist_ok=True)
 
-  # 获取所有PDF文件
-  pdf_files = []
+  # 获取所有PDF文件并去重
+  pdf_files = set()  # 使用集合来存储文件路径，自动去重
   for root, _, files in os.walk(config["pdf_folder"]):
     for file in files:
       if file.endswith('.pdf'):
-        pdf_files.append(os.path.join(root, file))
+        # 使用绝对路径避免重复
+        abs_path = os.path.abspath(os.path.join(root, file))
+        pdf_files.add(abs_path)
 
-  # 限制并行处理的数量
-  semaphore = asyncio.Semaphore(config.get("parallel_processes", 2))
+  if not pdf_files:
+    logging.info("未找到PDF文件")
+    return
+
+  logging.info(f"找到 {len(pdf_files)} 个PDF文件待处理")
+
+  # 限制并行处理的PDF文件数量
+  pdf_semaphore = asyncio.Semaphore(config["parallel_processes"]["pdf_files"])
 
   async def process_with_semaphore(pdf_path):
-    async with semaphore:
+    async with pdf_semaphore:
       return await process_pdf(pdf_path, config)
 
   # 并行处理所有PDF文件
