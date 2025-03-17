@@ -198,6 +198,15 @@ def extract_pdf_content(pdf_path, cache_dir):
       xref = img[0]
       base_image = doc.extract_image(xref)
       image_bytes = base_image["image"]
+      
+      # 检查图片尺寸
+      width = base_image.get("width", 0)
+      height = base_image.get("height", 0)
+      
+      # 忽略小于20x20像素的图片
+      if width < 20 or height < 20:
+        logging.info(f"忽略小图片：第 {page_num + 1} 页，大小 {width}x{height} 像素")
+        continue
 
       # 保存图片到缓存目录
       image_path = os.path.join(cache_dir, f"image_{page_num}_{xref}.png")
@@ -235,25 +244,25 @@ async def process_image(image_path, page_num, model_config, cache_dir):
 
       with open(image_path, "rb") as img_file:
         response = client.chat.completions.create(
-            model=model_config["name"],
-            messages=[{
-                "role": "user",
-                "content": [{
-                    "type": "text",
-                    "text": f"{model_config['prompt']} 请使用{model_config['response_language']}回答。"
-                }, {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/png;base64,{base64.b64encode(img_file.read()).decode('utf-8')}"
-                    }
-                }]
+          model=model_config["name"],
+          messages=[{
+            "role": "user",
+            "content": [{
+              "type": "text",
+              "text": f"{model_config['prompt']} 请使用{model_config['response_language']}回答。"
+            }, {
+              "type": "image_url",
+              "image_url": {
+                "url": f"data:image/png;base64,{base64.b64encode(img_file.read()).decode('utf-8')}"
+              }
             }]
+          }]
         )
 
       summary = response.choices[0].message.content
       save_cache(cache_dir, cache_name, summary)
       return page_num, summary
-      
+
     except Exception as e:
       last_error = str(e)
       retries += 1
@@ -351,8 +360,8 @@ async def process_text_chunk(
   while retries < text_model_config["max_retries"]:
     try:
       messages = [{
-          "role": "system",
-          "content": f"{text_model_config['system_prompt']} 请使用{text_model_config['response_language']}回答。"
+        "role": "system",
+        "content": f"{text_model_config['system_prompt']} 请使用{text_model_config['response_language']}回答。"
       }]
 
       if previous_summary:
@@ -363,13 +372,13 @@ async def process_text_chunk(
       messages.append({"role": "user", "content": prompt})
 
       response = client.chat.completions.create(
-          model=model_name,
-          messages=messages
+        model=model_name,
+        messages=messages
       )
       summary = response.choices[0].message.content
       save_cache(cache_dir, cache_name, summary)
       return summary
-      
+
     except Exception as e:
       last_error = str(e)
       retries += 1
@@ -399,19 +408,19 @@ async def generate_final_summary(
   while retries < text_model_config["max_retries"]:
     try:
       response = client.chat.completions.create(
-          model=model_name,
-          messages=[{
-              "role": "system",
-              "content": text_model_config["system_prompt"]
-          }, {
-              "role": "user",
-              "content": f"{text_model_config['final_summary_prompt']} {accumulated_summary}"
-          }]
+        model=model_name,
+        messages=[{
+          "role": "system",
+          "content": text_model_config["system_prompt"]
+        }, {
+          "role": "user",
+          "content": f"{text_model_config['final_summary_prompt']} {accumulated_summary}"
+        }]
       )
       summary = response.choices[0].message.content
       save_cache(cache_dir, cache_name, summary)
       return summary
-      
+
     except Exception as e:
       last_error = str(e)
       retries += 1
@@ -488,8 +497,8 @@ async def process_pdf(pdf_path, config):
 
         # 添加本文本块涉及页面的图片总结
         related_images = [
-            f"[图片总结 (第 {page_num + 1} 页): {completed_images.get(page_num, '处理中...')}]"
-            for page_num, _ in images if start_page <= page_num < end_page
+          f"[图片总结 (第 {page_num + 1} 页): {completed_images.get(page_num, '处理中...')}]"
+          for page_num, _ in images if start_page <= page_num < end_page
         ]
 
         chunk_with_images = chunk
@@ -497,8 +506,8 @@ async def process_pdf(pdf_path, config):
           chunk_with_images += "\n\n" + "\n".join(related_images)
 
         return await process_text_chunk(
-            text_client, text_model_config["name"], chunk_with_images,
-            previous_summary, cache_dir, chunk_index, text_model_config
+          text_client, text_model_config["name"], chunk_with_images,
+          previous_summary, cache_dir, chunk_index, text_model_config
         )
 
     # 创建一个异步队列来存储完成的图片结果
@@ -599,10 +608,10 @@ async def main_async():
 
   logging.info(f"找到 {len(pdf_files)} 个PDF文件待处理")
 
-  # 创建三个队列分别用于文本提取、图片处理和笔记生成
-  extraction_queue = asyncio.Queue()  # 待提取的PDF
-  image_queue = asyncio.Queue()      # 待处理的图片任务
-  note_queue = asyncio.Queue()       # 待生成笔记的文档
+  # 创建三个有限容量的队列分别用于文本提取、图片处理和笔记生成
+  extraction_queue = asyncio.Queue(maxsize=config["parallel_processes"]["pdf_files"] * 40)  # 待提取的PDF
+  image_queue = asyncio.Queue(maxsize=config["parallel_processes"]["images"] * 20)      # 待处理的图片任务
+  note_queue = asyncio.Queue(maxsize=config["parallel_processes"]["text_chunks"] * 80)       # 待生成笔记的文档
 
   # 创建信号量控制并发
   extraction_semaphore = asyncio.Semaphore(config["parallel_processes"]["pdf_files"])
@@ -611,6 +620,19 @@ async def main_async():
 
   # 存储处理结果
   doc_results = {}
+  # 存储每个PDF的图片总数和已处理图片数
+  doc_image_progress = {}
+
+  # 用于跟踪文档的所有图片是否已处理完成
+  async def check_and_queue_for_note_generation(pdf_path):
+    """检查PDF的所有图片是否已处理完成，如果完成则将其加入笔记生成队列"""
+    if pdf_path in doc_image_progress:
+      total_images, processed_images = doc_image_progress[pdf_path]
+      if processed_images >= total_images:
+        logging.info(f"{pdf_path} 的全部图片处理完成，加入笔记生成队列")
+        await note_queue.put(pdf_path)
+        # 防止重复加入队列
+        doc_image_progress[pdf_path] = (total_images, -1)
 
   # 文本提取工作者
   async def extraction_worker():
@@ -645,15 +667,22 @@ async def main_async():
             "text": text,
             "images": {},
             "cache_dir": cache_dir,
-            "processing": True
+            "processing": True,
+            "total_images": len(images)
           }
+          
+          # 记录图片数量
+          doc_image_progress[pdf_path] = (len(images), 0)
 
-          # 将图片任务加入队列
-          for page_num, image_path in images:
-            await image_queue.put((pdf_path, image_path, page_num))
-
-          # 将文档加入笔记生成队列
-          await note_queue.put(pdf_path)
+          # 如果没有图片，直接加入笔记生成队列
+          if len(images) == 0:
+            logging.info(f"{pdf_path} 没有图片，直接加入笔记生成队列")
+            await note_queue.put(pdf_path)
+          else:
+            # 将图片任务加入队列
+            logging.info(f"将 {pdf_path} 的 {len(images)} 张图片加入处理队列")
+            for page_num, image_path in images:
+              await image_queue.put((pdf_path, image_path, page_num))
 
         extraction_queue.task_done()
 
@@ -671,21 +700,39 @@ async def main_async():
           break
 
         pdf_path, image_path, page_num = task
-        async with image_semaphore:
-          if pdf_path in doc_results:  # 确保文档还在处理中
+        
+        # 只处理正在进行中的文档
+        if pdf_path in doc_results and doc_results[pdf_path]["processing"]:
+          logging.info(f"开始处理图片: {pdf_path} 第 {page_num + 1} 页")
+          async with image_semaphore:
             result = await process_image(
               image_path, 
               page_num, 
               config["models"]["image_model"],
               doc_results[pdf_path]["cache_dir"]
             )
+            
+            # 保存结果
             doc_results[pdf_path]["images"][page_num] = result[1]
-            logging.info(f"完成图片处理: {pdf_path} 第 {page_num + 1} 页")
+            
+            # 更新进度
+            if pdf_path in doc_image_progress:
+              total, processed = doc_image_progress[pdf_path]
+              doc_image_progress[pdf_path] = (total, processed + 1)
+              logging.info(f"完成图片处理: {pdf_path} 第 {page_num + 1} 页 ({processed + 1}/{total})")
+              
+              # 检查是否所有图片都已处理完成
+              await check_and_queue_for_note_generation(pdf_path)
 
         image_queue.task_done()
 
       except Exception as e:
         logging.error(f"图片处理工作者出错: {str(e)}")
+        # 更新失败计数但仍然标记为处理完成
+        if pdf_path in doc_image_progress:
+          total, processed = doc_image_progress[pdf_path]
+          doc_image_progress[pdf_path] = (total, processed + 1)
+          await check_and_queue_for_note_generation(pdf_path)
         image_queue.task_done()
 
   # 笔记生成工作者
@@ -697,17 +744,20 @@ async def main_async():
           note_queue.task_done()
           break
 
-        async with note_semaphore:
-          if pdf_path in doc_results and doc_results[pdf_path]["processing"]:
-            # 检查是否可以生成笔记（是否在允许的时间窗口内）
-            text_model_config = config["models"]["text_model"]
-            if not is_time_to_send(text_model_config["available_hours"]):
-              # 如果不在时间窗口内，重新加入队列
-              await note_queue.put(pdf_path)
-              note_queue.task_done()
-              continue
+        # 只处理正在进行中的文档
+        if pdf_path in doc_results and doc_results[pdf_path]["processing"]:
+          # 检查是否可以生成笔记（是否在允许的时间窗口内）
+          text_model_config = config["models"]["text_model"]
+          if not is_time_to_send(text_model_config["available_hours"]):
+            # 如果不在时间窗口内，重新加入队列并等待一段时间
+            logging.info(f"{pdf_path} 不在可处理时间窗口内，延迟处理")
+            await asyncio.sleep(60)  # 等待1分钟后重试
+            await note_queue.put(pdf_path)
+            note_queue.task_done()
+            continue
 
-            logging.info(f"开始生成 {pdf_path} 的笔记")
+          logging.info(f"开始生成 {pdf_path} 的笔记")
+          async with note_semaphore:
             await process_doc(
               pdf_path,
               config,
@@ -744,14 +794,22 @@ async def main_async():
   # 发送结束信号
   for _ in range(len(extraction_workers)):
     await extraction_queue.put(None)
+
+  # 等待提取队列处理完成
+  await extraction_queue.join()
+  
+  # 发送图片队列结束信号
   for _ in range(len(image_workers)):
     await image_queue.put(None)
+    
+  # 等待图片队列处理完成
+  await image_queue.join()
+  
+  # 发送笔记队列结束信号
   for _ in range(len(note_workers)):
     await note_queue.put(None)
-
-  # 等待所有队列处理完成
-  await extraction_queue.join()
-  await image_queue.join()
+    
+  # 等待笔记队列处理完成  
   await note_queue.join()
 
   # 等待所有工作者结束
@@ -761,9 +819,10 @@ async def main_async():
 
   # 统计处理结果
   success_count = sum(1 for v in doc_results.values() if not v["processing"])
+  skipped_count = len(pdf_files) - len(doc_results)
   total_count = len(pdf_files)
 
-  logging.info(f"处理完成! 成功: {success_count}/{total_count}")
+  logging.info(f"处理完成! 成功: {success_count}, 跳过: {skipped_count}, 总计: {total_count}")
 
 async def process_doc(pdf_path, config, image_results):
   """处理单个文献的文本内容"""
