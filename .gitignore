@@ -79,6 +79,7 @@ target/
 config.json
 pdf/
 pdf
+markdown_note
 
 # 忽略缓存文件夹
 cache/
